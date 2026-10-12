@@ -206,6 +206,10 @@ def fetch_once(policy: SourcePolicy, *, consent_url: str) -> Capture:
             size+=len(part)
             if size>policy.max_bytes:
                 raise SourceRejected('BODY_SIZE_LIMIT')
+            # HTTPResponse may close its socket as soon as the declared body is
+            # complete. Do not set a timeout on that closed socket on another loop.
+            if length is not None and size==int(length):
+                break
         if length is not None and size!=int(length):
             raise SourceRejected('INCOMPLETE_BODY')
         if not size:
@@ -217,6 +221,8 @@ def fetch_once(policy: SourcePolicy, *, consent_url: str) -> Capture:
     except (OSError,http.client.HTTPException) as exc:
         raise SourceRejected('TRANSPORT_OR_PROTOCOL_FAILURE') from exc
     finally:
+        if response is not None and hasattr(response,'close'):
+            response.close()
         conn.close()
 
 
