@@ -1,14 +1,15 @@
 """One explicitly permitted source check, not a crawler or scheduled monitor.
 
 No credentials, proxies, redirects, scripts, HTML rendering or automatic evidence
-admission. Bodies are stored only inside the encrypted Vault. URLs and responses
-are not uploaded anywhere by this module. Public network destinations can log
-that a request occurred. DNS timing depends on the operating-system resolver.
+admission. Bodies are stored only inside the encrypted Vault. Source identifiers
+are random, not guessable hashes of their URLs. Remote servers can log a request.
+DNS and response-header timing still depend on OS/library behavior: deployment
+must additionally enforce an outer process deadline and network egress policy.
 """
 from __future__ import annotations
 import argparse
 import base64
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import getpass
 import hashlib
@@ -22,12 +23,12 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-from vault import Vault, VaultError, Receipt, canonical, strict_json
+from vault import Vault, VaultError, canonical, strict_json, check_id
 
-MIMES = frozenset({'text/plain','text/html','text/csv','application/json',
-                   'application/pdf','application/xml','text/xml'})
-HOST_LABEL = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
-MAX_FETCH = 8*1024*1024
+MIMES=frozenset({'text/plain','text/html','text/csv','application/json',
+                 'application/pdf','application/xml','text/xml'})
+HOST_LABEL=re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+MAX_FETCH=8*1024*1024
 
 
 class SourceRejected(VaultError):
@@ -35,15 +36,15 @@ class SourceRejected(VaultError):
 
 
 def canonical_url(value: str) -> str:
-    if (not isinstance(value,str) or not 1 <= len(value) <= 2048 or
-        any(ord(c) <= 32 or ord(c) >= 127 for c in value) or '\\' in value):
+    if (not isinstance(value,str) or not 1<=len(value)<=2048 or
+        any(ord(c)<=32 or ord(c)>=127 for c in value) or '\\' in value):
         raise SourceRejected('URL_REQUIRES_UNAMBIGUOUS_ASCII_ENCODING')
     try:
-        u = urlsplit(value)
-        port = u.port
+        u=urlsplit(value)
+        port=u.port
     except ValueError as exc:
         raise SourceRejected('INVALID_URL') from exc
-    if (u.scheme != 'https' or u.username is not None or u.password is not None or
+    if (u.scheme!='https' or u.username is not None or u.password is not None or
         not u.hostname or port not in (None,443) or u.fragment or u.query):
         raise SourceRejected('HTTPS_ONLY_NO_CREDENTIALS_QUERY_OR_FRAGMENT')
     host=u.hostname.lower()
@@ -85,7 +86,7 @@ def public_endpoints(host: str) -> list[tuple[int,tuple]]:
 
 
 class PinnedHTTPS(http.client.HTTPSConnection):
-    """Uses the validated numeric address, while verifying the original TLS name."""
+    """Connect to a validated numeric address; verify the original TLS hostname."""
     def __init__(self,host: str,endpoint: tuple[int,tuple],timeout: float):
         context=ssl.create_default_context()
         context.set_alpn_protocols(['http/1.1'])
@@ -100,7 +101,7 @@ class PinnedHTTPS(http.client.HTTPSConnection):
         try:
             raw.settimeout(self.timeout)
             raw.connect(address)
-            if ipaddress.ip_address(raw.getpeername()[0]) != ipaddress.ip_address(address[0]):
+            if ipaddress.ip_address(raw.getpeername()[0])!=ipaddress.ip_address(address[0]):
                 raise SourceRejected('PEER_ADDRESS_MISMATCH')
             self.sock=self._context.wrap_socket(raw,server_hostname=self.host)
         except BaseException:
@@ -114,10 +115,11 @@ class SourcePolicy:
     max_bytes: int=2*1024*1024
     timeout_seconds: float=15.0
     mime_types: tuple[str,...]=tuple(sorted(MIMES))
+    source_id: str=field(default_factory=lambda:uuid.uuid4().hex)
 
     def __post_init__(self):
-        normalized=canonical_url(self.url)
-        object.__setattr__(self,'url',normalized)
+        object.__setattr__(self,'url',canonical_url(self.url))
+        check_id(self.source_id)
         if type(self.max_bytes) is not int or not 1<=self.max_bytes<=MAX_FETCH:
             raise SourceRejected('INVALID_SIZE_LIMIT')
         if (type(self.timeout_seconds) not in (int,float) or
@@ -127,7 +129,7 @@ class SourcePolicy:
 
     @property
     def record_id(self):
-        return uuid.uuid5(uuid.NAMESPACE_URL,'fractalgo-source/1:'+self.url).hex
+        return self.source_id
 
 
 @dataclass(frozen=True)
@@ -143,13 +145,12 @@ class Capture:
 
 
 def fetch_once(policy: SourcePolicy, *, consent_url: str) -> Capture:
-    if canonical_url(consent_url) != policy.url:
+    if canonical_url(consent_url)!=policy.url:
         raise SourceRejected('EXACT_SOURCE_PERMISSION_REQUIRED')
     u=urlsplit(policy.url)
     endpoints=public_endpoints(u.hostname)
     deadline=time.monotonic()+policy.timeout_seconds
     conn=None
-    # Try at most two already validated addresses. Never re-resolve at connect.
     for endpoint in endpoints[:2]:
         remaining=deadline-time.monotonic()
         if remaining<=0:
@@ -163,19 +164,27 @@ def fetch_once(policy: SourcePolicy, *, consent_url: str) -> Capture:
             trial.close()
     if conn is None:
         raise SourceRejected('TLS_CONNECTION_FAILED')
+    response=None
     try:
+        transport=conn.sock
+        remaining=deadline-time.monotonic()
+        if remaining<=0:
+            raise SourceRejected('FETCH_DEADLINE')
+        transport.settimeout(remaining)
         conn.request('GET',u.path or '/',headers={
             'User-Agent':'FractalGo-source-check/0.1 (explicit single-source request)',
-            'Accept':', '.join(policy.mime_types),
-            'Accept-Encoding':'identity',
+            'Accept':', '.join(policy.mime_types),'Accept-Encoding':'identity',
             'Connection':'close'})
+        remaining=deadline-time.monotonic()
+        if remaining<=0:
+            raise SourceRejected('FETCH_DEADLINE')
+        transport.settimeout(remaining)
         response=conn.getresponse()
         if 300<=response.status<400:
             raise SourceRejected('REDIRECT_REQUIRES_NEW_PERMISSION')
         if response.status!=200:
             raise SourceRejected('HTTP_STATUS_'+str(response.status))
-        if (response.getheader('Content-Encoding','identity').strip().lower()
-            not in ('','identity')):
+        if response.getheader('Content-Encoding','identity').strip().lower() not in ('','identity'):
             raise SourceRejected('COMPRESSED_BODY_DISABLED')
         mime=response.getheader('Content-Type','').split(';',1)[0].strip().lower()
         if mime not in policy.mime_types:
@@ -183,8 +192,6 @@ def fetch_once(policy: SourcePolicy, *, consent_url: str) -> Capture:
         length=response.getheader('Content-Length')
         if length is not None and (not length.isdigit() or int(length)>policy.max_bytes):
             raise SourceRejected('CONTENT_LENGTH_LIMIT')
-        # HTTPResponse may own the socket after a Connection: close response.
-        transport=conn.sock or response.fp.raw._sock
         chunks=[]
         size=0
         while True:
@@ -215,7 +222,7 @@ def fetch_once(policy: SourcePolicy, *, consent_url: str) -> Capture:
 
 def check_and_store(vault: Vault, policy: SourcePolicy, *, consent_url: str,
                     fetcher=None) -> dict:
-    vault._ready()  # No external request when the local vault is locked.
+    vault._ready()
     if canonical_url(consent_url)!=policy.url:
         raise SourceRejected('EXACT_SOURCE_PERMISSION_REQUIRED')
     history=vault.history(policy.record_id)
@@ -248,17 +255,18 @@ def check_and_store(vault: Vault, policy: SourcePolicy, *, consent_url: str,
 
 
 def main() -> int:
-    p=argparse.ArgumentParser(description='Consultar una URL pública explícita y conservarla cifrada, pendiente de revisión')
+    p=argparse.ArgumentParser(description='Consulta pública explícita y almacenamiento cifrado pendiente de revisión')
     p.add_argument('database')
     p.add_argument('url')
     p.add_argument('--allow-exact-url',required=True)
+    p.add_argument('--source-id',help='Identificador del recibo anterior para continuar la misma fuente')
     a=p.parse_args()
     vault=None
     try:
-        policy=SourcePolicy(a.url)
+        kwargs={} if a.source_id is None else {'source_id':a.source_id}
+        policy=SourcePolicy(a.url,**kwargs)
         vault=Vault.open(a.database,getpass.getpass('Contraseña de la bóveda: '))
-        result=check_and_store(vault,policy,consent_url=a.allow_exact_url)
-        print(json.dumps(result,indent=2))
+        print(json.dumps(check_and_store(vault,policy,consent_url=a.allow_exact_url),indent=2))
         return 0
     except (VaultError,OSError) as exc:
         print(json.dumps({'status':'REJECTED','reason':str(exc)}))
