@@ -34,7 +34,9 @@ jobs:
           set -euo pipefail
           python3 -m venv .venv
           .venv/bin/python -m pip install -r fractalgo_custody/requirements.txt
-      - name: Execute custody tests and record results
+      - name: Execute contracts twice and the explicitly permitted public-source check
+        env:
+          FG_RUN_PUBLIC_SOURCE_PROBE: '1'
         run: .venv/bin/python fractalgo_custody/ci.py
       - name: Retain code and actual validation evidence
         if: always()
@@ -44,7 +46,7 @@ jobs:
           path: |
             fractalgo_custody/*.py
             fractalgo_custody/requirements.txt
-            fractalgo_custody/README.md
+            fractalgo_custody/*.md
             fractalgo_custody/evidence/*
           if-no-files-found: error
           retention-days: 7
