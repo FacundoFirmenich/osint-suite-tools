@@ -1,0 +1,2 @@
+# Reproducible experimental pin, not a claim of latest release or security certification.
+cryptography==46.0.3
