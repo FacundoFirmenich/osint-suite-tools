@@ -1,0 +1,50 @@
+name: FractalGo custody — isolated validation
+
+on:
+  push:
+    branches: ['fractalgo/g15-custody-prototype']
+    paths:
+      - 'fractalgo_custody/**'
+      - '.github/workflows/fractalgo-custody.yml'
+  pull_request:
+    branches: ['master']
+    paths:
+      - 'fractalgo_custody/**'
+      - '.github/workflows/fractalgo-custody.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  custody:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Read exact public commit without stored credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Install only the isolated custody dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r fractalgo_custody/requirements.txt
+      - name: Execute custody tests and record results
+        run: .venv/bin/python fractalgo_custody/ci.py
+      - name: Retain code and actual validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fractalgo-custody-${{ github.run_id }}
+          path: |
+            fractalgo_custody/*.py
+            fractalgo_custody/requirements.txt
+            fractalgo_custody/README.md
+            fractalgo_custody/evidence/*
+          if-no-files-found: error
+          retention-days: 7
